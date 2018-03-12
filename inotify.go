@@ -1,8 +1,14 @@
 package goinotify
 
+/*
+#include <sys/inotify.h>
+*/
+import "C"
 import (
 	"sync"
 	"syscall"
+	"time"
+	"unsafe"
 )
 
 type Watcher struct {
@@ -11,12 +17,20 @@ type Watcher struct {
 
 	end     chan struct{}
 	endLock *sync.Mutex
+
+	events      []InotifyEventRaw
+	eventsLock  *sync.Mutex
+	eventNotify chan struct{}
 }
 
 func NewWatcher(flags int) (w *Watcher, err error) {
 	w = &Watcher{
 		end:     make(chan struct{}),
 		endLock: &sync.Mutex{},
+
+		events:      []InotifyEventRaw{},
+		eventsLock:  &sync.Mutex{},
+		eventNotify: make(chan struct{}),
 	}
 
 	if w.inotifyFd, err = syscall.InotifyInit1(flags); err != nil {
@@ -37,26 +51,99 @@ func NewWatcher(flags int) (w *Watcher, err error) {
 		syscall.Close(w.epfd)
 		return
 	}
-	go w.serv()
+	go w.readEvents()
 
 	return
 }
 
-func (w *Watcher) serv() {
+func (w *Watcher) readEvents() {
 	events := make([]syscall.EpollEvent, _MAX_EVENTS, _MAX_EVENTS)
 	buffer := make([]byte, _MAX_BUFFER_SIZE, _MAX_BUFFER_SIZE)
-	for {
-		nevents, err := syscall.EpollWait(w.epfd, events, _EPOLL_WAIT_TIMEOUT_MS)
+	offset := 0
+	for !w.IsClose() {
+		nevents, err := syscall.EpollWait(w.epfd, events,
+			_EPOLL_WAIT_TIMEOUT_MS)
 		if err != nil {
 			return
 		}
 
 		for i := 0; i < nevents; i++ {
-			n, err := syscall.Read(int(events[i].Fd), buffer)
-			if err != nil {
-				return
+			if events[i].Events&syscall.EPOLLIN != 0 {
+				n, err := syscall.Read(int(events[i].Fd), buffer[offset:])
+				if err != nil {
+					return
+				}
+				n += offset
+
+				w.eventsLock.Lock()
+				j := 0
+				for j < n {
+					if n-j < syscall.SizeofInotifyEvent {
+						offset = copy(buffer, buffer[j:])
+						break
+					}
+
+					e := (*syscall.InotifyEvent)(unsafe.Pointer(&buffer[j]))
+					size := syscall.SizeofInotifyEvent + e.Len
+					if n-j < int(size) {
+						offset = copy(buffer, buffer[j:])
+						break
+					}
+
+					raw := InotifyEventRaw(make([]byte, size, size))
+					copy(raw, buffer[j:])
+					w.events = append(w.events, raw)
+					j += int(size)
+				}
+				if j == n {
+					offset = 0
+				}
+				w.notifyEvents()
+				w.eventsLock.Unlock()
 			}
-			// var e syscall.InotifyEvent
+		}
+	}
+}
+
+func (w *Watcher) notifyEvents() {
+	select {
+	case w.eventNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (w *Watcher) GetEvent(timeout time.Duration) (r InotifyEventRaw, err error) {
+	for {
+		r = nil
+		w.eventsLock.Lock()
+		if len(w.events) > 0 {
+			r = w.events[0]
+			w.events = w.events[1:]
+
+			if len(w.events) > 0 {
+				w.notifyEvents()
+			}
+		}
+		w.eventsLock.Unlock()
+
+		if r != nil {
+			return
+		}
+
+		var deadline <-chan time.Time
+		if timeout > 0 {
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			deadline = timer.C
+
+		}
+		select {
+		case <-w.eventNotify:
+			break
+		case <-deadline:
+			return nil, ERR_TIMEOUT
+		case <-w.end:
+			return nil, ERR_WATCHER_WAS_CLOSED
 		}
 	}
 }
