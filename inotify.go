@@ -9,14 +9,14 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/solomonwzs/goxutil/closer"
 )
 
 type Watcher struct {
+	closer.Closer
 	inotifyFd int
 	epfd      int
-
-	end     chan struct{}
-	endLock *sync.Mutex
 
 	events      []InotifyEventRaw
 	eventsLock  *sync.Mutex
@@ -25,9 +25,6 @@ type Watcher struct {
 
 func NewWatcher(flags int) (w *Watcher, err error) {
 	w = &Watcher{
-		end:     make(chan struct{}),
-		endLock: &sync.Mutex{},
-
 		events:      []InotifyEventRaw{},
 		eventsLock:  &sync.Mutex{},
 		eventNotify: make(chan struct{}),
@@ -51,8 +48,14 @@ func NewWatcher(flags int) (w *Watcher, err error) {
 		syscall.Close(w.epfd)
 		return
 	}
-	go w.readEvents()
 
+	w.Closer = closer.NewCloser(func() error {
+		syscall.Close(w.inotifyFd)
+		syscall.Close(w.epfd)
+		return nil
+	})
+
+	go w.readEvents()
 	return
 }
 
@@ -60,7 +63,7 @@ func (w *Watcher) readEvents() {
 	events := make([]syscall.EpollEvent, _MAX_EVENTS, _MAX_EVENTS)
 	buffer := make([]byte, _MAX_BUFFER_SIZE, _MAX_BUFFER_SIZE)
 	offset := 0
-	for !w.IsClose() {
+	for !w.IsClosed() {
 		nevents, err := syscall.EpollWait(w.epfd, events,
 			_EPOLL_WAIT_TIMEOUT_MS)
 		if err != nil {
@@ -112,7 +115,8 @@ func (w *Watcher) notifyEvents() {
 	}
 }
 
-func (w *Watcher) GetEvent(timeout time.Duration) (r InotifyEventRaw, err error) {
+func (w *Watcher) GetEvent(timeout time.Duration) (
+	r InotifyEventRaw, err error) {
 	for {
 		r = nil
 		w.eventsLock.Lock()
@@ -142,39 +146,18 @@ func (w *Watcher) GetEvent(timeout time.Duration) (r InotifyEventRaw, err error)
 			break
 		case <-deadline:
 			return nil, ERR_TIMEOUT
-		case <-w.end:
+		case <-w.Done():
 			return nil, ERR_WATCHER_WAS_CLOSED
 		}
 	}
 }
 
-func (w *Watcher) AddWatch(pathname string, mask uint32) (watchdesc int, err error) {
+func (w *Watcher) AddWatch(pathname string, mask uint32) (
+	watchdesc int, err error) {
 	return syscall.InotifyAddWatch(w.inotifyFd, pathname, mask)
 }
 
 func (w *Watcher) DelWatch(watchdesc int) (err error) {
 	_, err = syscall.InotifyRmWatch(w.inotifyFd, uint32(watchdesc))
 	return
-}
-
-func (w *Watcher) Close() error {
-	w.endLock.Lock()
-	defer w.endLock.Unlock()
-
-	if w.IsClose() {
-		return ERR_WATCHER_WAS_CLOSED
-	}
-	close(w.end)
-	syscall.Close(w.inotifyFd)
-	syscall.Close(w.epfd)
-	return nil
-}
-
-func (w *Watcher) IsClose() bool {
-	select {
-	case <-w.end:
-		return true
-	default:
-		return false
-	}
 }
